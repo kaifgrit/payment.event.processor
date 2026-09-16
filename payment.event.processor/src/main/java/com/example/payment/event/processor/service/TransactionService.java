@@ -5,6 +5,9 @@ import com.example.payment.event.processor.dto.TransactionResponse;
 import com.example.payment.event.processor.entity.Transaction;
 import com.example.payment.event.processor.entity.TransactionType;
 import com.example.payment.event.processor.entity.Wallet;
+import com.example.payment.event.processor.exception.DuplicateTransactionException;
+import com.example.payment.event.processor.exception.InsufficientFundsException;
+import com.example.payment.event.processor.exception.WalletNotFoundException;
 import com.example.payment.event.processor.repository.TransactionRepository;
 import com.example.payment.event.processor.repository.WalletRepository;
 import jakarta.transaction.Transactional;
@@ -27,35 +30,47 @@ public class TransactionService {
     @Transactional
     public TransactionResponse process(TransactionRequest request) {
 
-        // 1. Acquire database lock on the wallet
+        // 1. Check whether this transaction was already processed.
+        if (transactionRepository.existsByTransactionId(request.transactionId())) {
+            throw new DuplicateTransactionException(
+                    "Transaction already processed: " + request.transactionId()
+            );
+        }
+
+        // 2. Only DEBIT is required for this assignment.
+        if (request.type() != TransactionType.DEBIT) {
+            throw new IllegalArgumentException(
+                    "Only DEBIT transactions are supported"
+            );
+        }
+
+        // 3. Fetch the wallet with PESSIMISTIC_WRITE locking.
+        //    This prevents concurrent debit requests from reading
+        //    the same balance and causing a race condition.
         Wallet wallet = walletRepository.findByUserId(request.userId())
                 .orElseThrow(() ->
-                        new RuntimeException("Wallet not found")
+                        new WalletNotFoundException(
+                                "Wallet not found for user: " + request.userId()
+                        )
                 );
 
-        // 2. Check for duplicate transaction
-        if (transactionRepository.existsByTransactionId(request.transactionId())) {
-            throw new RuntimeException("Transaction already processed");
-        }
-
-        // 3. Currently this assignment focuses on DEBIT
-        if (request.type() != TransactionType.DEBIT) {
-            throw new RuntimeException("Only DEBIT transactions are supported");
-        }
-
-        // 4. Check balance
+        // 4. Check whether the wallet has enough money.
         if (wallet.getBalance().compareTo(request.amount()) < 0) {
-            throw new RuntimeException("Insufficient funds");
+            throw new InsufficientFundsException(
+                    "Insufficient funds for transaction: "
+                            + request.transactionId()
+            );
         }
 
-        // 5. Deduct amount
+        // 5. Deduct the requested amount.
         wallet.setBalance(
                 wallet.getBalance().subtract(request.amount())
         );
 
+        // 6. Save the updated wallet balance.
         walletRepository.save(wallet);
 
-        // 6. Store transaction
+        // 7. Create a transaction record.
         Transaction transaction = new Transaction(
                 request.transactionId(),
                 request.userId(),
@@ -63,9 +78,10 @@ public class TransactionService {
                 request.type()
         );
 
+        // 8. Save the transaction.
         transactionRepository.save(transaction);
 
-        // 7. Return result
+        // 9. Return the successful response.
         return new TransactionResponse(
                 request.transactionId(),
                 request.userId(),
